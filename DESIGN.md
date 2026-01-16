@@ -37,12 +37,42 @@ spec:
   volumeMode: Filesystem
 ```
 
+## Source Database Access
+
+In the namespace of the CNPG `Cluster` object, there are secrets which
+provide access to the `streaming_replica` role, which also has access to
+invoke the `pg_backup_start()` and `pg_backup_stop()` functions.
+
+```text
+NAME                      TYPE                DATA   AGE
+pg-xyz-ca            Opaque              2      21h
+pg-xyz-replication   kubernetes.io/tls   2      21h
+```
+
+```yaml
+apiVersion: v1
+data:
+  ca.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUJsekNDQVQ2Z0F3SUJBZ0lRUkw4eGlLSWV5WTBXU3MwcSsvTHFrVEFLQmdncWhrak9QUVFEQWpBc01SUXcKRWdZRFZRUUxFd3R3WnkxbWIyeHNiM2RsY2pFVU1CSUdBMVVFQXhNTGNHY3RabTlzYkc5M1pYSXdIaGNOTWpZdwpNVEUxTVRjME56QTBXaGNOTWpZd05ERTFNVGMwTnpBMFdqQXNNUlF3RWdZRFZRUUxFd3R3WnkxbWIyeHNiM2RsCmNqRVVNQklHQTFVRUF4TUxjR2N0Wm05c2JHOTNaWEl3V1RBVEJnY3Foa2pPUFFJQkJnZ3Foa2pPUFFNQkJ3TkMKQUFTMUFSc2EzU3hQTmtxTjlSc0NhWWM2Sjh2UmoyUERxQy93Q3BTUStnYnFNamtnQ3JlU2gvNml0SitQTlp3TApuN242MC9ObjdUcms5bThqNHVoWUt2NWtvMEl3UURBT0JnTlZIUThCQWY4RUJBTUNBZ1F3RHdZRFZSMFRBUUgvCkJBVXdBd0VCL3pBZEJnTlZIUTRFRmdRVWI1OThiNlNoVkxicE0ydW1ha3NURm1tdWF6SXdDZ1lJS29aSXpqMEUKQXdJRFJ3QXdSQUlnQUpUS0cxUVZGWmJ5SDBrbm9FbUZ1bm9ldTlHRjB6UFRPcWFDQ0ZuVEJWd0NJRHE0VStwUApFSEU4ekpZd01zbEVvam8yWnNTN3FDQ29CR3hNck1zeVhKYnMKLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=
+  ca.key: LS0tLS1CRUdJTiBFQyBQUklWQVRFIEtFWS0tLS0tCk1IY0NBUUVFSU1CQk9LVS9TUVk3MnNFUUJpWFU5dlJocGlkVGFwQi9xU3R3SnBXdXA5elFvQW9HQ0NxR1NNNDkKQXdFSG9VUURRZ0FFdFFFYkd0MHNUelpLamZVYkFtbUhPaWZMMFk5anc2Z3Y4QXFVa1BvRzZqSTVJQXEza29mKwpvclNmanpXY0M1KzUrdFB6WiswNjVQWnZJK0xvV0NyK1pBPT0KLS0tLS1FTkQgRUMgUFJJVkFURSBLRVktLS0tLQo=
+kind: Secret
+metadata:
+  creationTimestamp: "2026-01-15T17:52:04Z"
+  labels:
+    app.kubernetes.io/managed-by: cloudnative-pg
+  name: pg-xyz-ca
+  namespace: pg-xyz
+```
+
 ## Reconciliation Loop
 
 * Watch for new PVC objects matching our storageClassName
-* Confirm the referenced pg cluster exists and is on our node, otherwise skip it.
-* Connect to the source PG cluster with admin user and postgresql client protocol
-* `pg_backup_start('namespace/pvcname', true)`
-* Request a reflink snapshot into a local filesystem directory which will become the PV
-* Populate the `backup_label` file with the response from `pg_backup_stop()`
+* Look at the volume specified in dataSourceRef
+* Find the associated cnpg pod
+* Connect to the postgresql sevrer on the cnpg pod as the `streaming_replica` role using the postgresql client protocol. Use the secrets under Source Database Access to authenticate the connection.
+* Call `reflink_snapshot(label)`
 * Create the PV object, referencing the local filesystem directory with `hostPath` or `local`
+
+## Environment Variables
+
+HOSTPATH_PREFIX - where the snapshots will be created, used to configure
+the the `hostPath.path` or `local` volume.
