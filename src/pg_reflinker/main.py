@@ -202,16 +202,11 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
         os.unlink(client_key_path)
         os.unlink(ca_cert_path)
 
-@kopf.on.delete('persistentvolume')
+@kopf.on.delete('persistentvolume', labels={'app.kubernetes.io/managed-by': 'pg-reflinker'})
 def handle_pv_delete(name, **kwargs):
     """
     Handle deletion of PVs managed by pg-reflinker to clean up reflink snapshots.
     """
-    # Check if this PV is managed by us
-    labels = kwargs.get('labels', {})
-    if labels.get('app.kubernetes.io/managed-by') != 'pg-reflinker':
-        return  # Not our PV
-
     # Get source information from annotations
     annotations = kwargs.get('annotations', {})
     source_cluster = annotations.get('pg-reflinker/source-cluster')
