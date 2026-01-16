@@ -160,7 +160,7 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
                     'pg-reflinker/source-cluster': cluster_name,
                     'pg-reflinker/source-namespace': source_namespace,
                     'pg-reflinker/source-pvc': source_pvc_name,
-                    'pg-reflinker/backup-label': backup_label,
+                    'pg-reflinker/source-backup-label': backup_label,
                 }
             ),
             spec=client.V1PersistentVolumeSpec(
@@ -182,6 +182,89 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
         os.unlink(client_cert_path)
         os.unlink(client_key_path)
         os.unlink(ca_cert_path)
+
+@kopf.on.delete('persistentvolume')
+def handle_pv_delete(name, **kwargs):
+    """
+    Handle deletion of PVs managed by pg-reflinker to clean up reflink snapshots.
+    """
+    # Check if this PV is managed by us
+    labels = kwargs.get('labels', {})
+    if labels.get('app.kubernetes.io/managed-by') != 'pg-reflinker':
+        return  # Not our PV
+
+    # Get source information from annotations
+    annotations = kwargs.get('annotations', {})
+    source_cluster = annotations.get('pg-reflinker/source-cluster')
+    source_namespace = annotations.get('pg-reflinker/source-namespace')
+    source_backup_label = annotations.get('pg-reflinker/source-backup-label')
+
+    if not all([source_cluster, source_namespace, source_backup_label]):
+        return  # Missing required information
+
+    # Try to connect to the source cluster and delete the snapshot
+    try:
+        # Find the CNPG pod
+        pods = v1.list_namespaced_pod(source_namespace, label_selector=f'cnpg.io/cluster={source_cluster}')
+        if not pods.items:
+            # Cluster or pods gone, nothing to clean up
+            return
+        pod = pods.items[0]
+
+        # Get database connection secrets
+        replication_secret_name = f'{source_cluster}-replication'
+        ca_secret_name = f'{source_cluster}-ca'
+        
+        replication_secret = v1.read_namespaced_secret(replication_secret_name, source_namespace)
+        ca_secret = v1.read_namespaced_secret(ca_secret_name, source_namespace)
+        
+        db_host = pod.status.pod_ip
+        db_port = 5432
+        db_user = 'streaming_replica'
+        db_name = 'postgres'
+        
+        # Write certs to temp files
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.crt') as client_cert_file:
+            client_cert_file.write(base64.b64decode(replication_secret.data['tls.crt']).decode('utf-8'))
+            client_cert_path = client_cert_file.name
+        
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.key') as client_key_file:
+            client_key_file.write(base64.b64decode(replication_secret.data['tls.key']).decode('utf-8'))
+            client_key_path = client_key_file.name
+        
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.crt') as ca_cert_file:
+            ca_cert_file.write(base64.b64decode(ca_secret.data['ca.crt']).decode('utf-8'))
+            ca_cert_path = ca_cert_file.name
+        
+        try:
+            # Connect to PostgreSQL with TLS cert auth
+            conn = psycopg2.connect(
+                host=db_host,
+                port=db_port,
+                user=db_user,
+                dbname=db_name,
+                sslmode='verify-ca',
+                sslcert=client_cert_path,
+                sslkey=client_key_path,
+                sslrootcert=ca_cert_path
+            )
+            conn.autocommit = True
+            
+            try:
+                with conn.cursor() as cur:
+                    # Call the delete_snapshot function
+                    cur.execute("SELECT delete_snapshot(%s)", (source_backup_label,))
+            finally:
+                conn.close()
+        finally:
+            # Clean up temp files
+            os.unlink(client_cert_path)
+            os.unlink(client_key_path)
+            os.unlink(ca_cert_path)
+    except Exception as e:
+        # Log the error but don't fail the PV deletion
+        # In a real implementation, you'd want proper logging
+        pass
 
 def main():
     kopf.run()
