@@ -247,6 +247,17 @@ def handle_pv_delete(name, **kwargs):
         # In a real implementation, you'd want proper logging
         pass
 
+@kopf.on.update('persistentvolume', labels={'app.kubernetes.io/managed-by': 'pg-reflinker'}, field='status.phase')
+def handle_pv_failed(old, new, **kwargs):
+    """
+    Handle PVs that enter Failed phase by auto-deleting them for cleanup.
+    """
+    if new == 'Failed':
+        # Get the PV object from kwargs
+        pv = kwargs['body']
+        name = pv['metadata']['name']
+        v1.delete_persistent_volume(name)
+
 def main():
     kopf.run()
 
