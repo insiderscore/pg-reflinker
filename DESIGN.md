@@ -76,3 +76,7 @@ metadata:
 
 HOSTPATH_PREFIX - where the snapshots will be created, used to configure
 the the `hostPath.path` or `local` volume.
+
+NAMESPACE_PATH - comma-delimited list of namespaces to search for the source PVC
+if the dataSourceRef does not specify a namespace (e.g., due to API server filtering).
+The operator first checks the current namespace, then each namespace in this list.
