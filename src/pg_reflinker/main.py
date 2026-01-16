@@ -144,6 +144,16 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
     if not cluster_name:
         raise kopf.PermanentError("Source PVC must be owned by a CNPG Cluster")
 
+    # Get node affinity from the source PVC's bound PV
+    node_affinity = None
+    if source_pvc.status.phase == 'Bound' and source_pvc.spec.volume_name:
+        try:
+            source_pv = v1.read_persistent_volume(source_pvc.spec.volume_name)
+            node_affinity = source_pv.spec.node_affinity
+        except ApiException as e:
+            # Log but don't fail - node affinity is optional
+            pass
+
     # Get CNPG pod and secrets
     pod = get_cnpg_pod(cluster_name, source_namespace)
     replication_secret, ca_secret = get_db_secrets(cluster_name, source_namespace)
@@ -188,6 +198,7 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
                 host_path=client.V1HostPathVolumeSource(path=pv_path),
                 storage_class_name=storage_class_name,
                 persistent_volume_reclaim_policy=reclaim_policy,
+                node_affinity=node_affinity,
                 claim_ref=client.V1ObjectReference(
                     kind='PersistentVolumeClaim',
                     name=name,
