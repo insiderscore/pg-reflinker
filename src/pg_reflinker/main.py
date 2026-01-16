@@ -20,6 +20,7 @@ except config.ConfigException:
 
 # Kubernetes API clients
 v1 = client.CoreV1Api()
+storage_v1 = client.StorageV1Api()
 custom_api = client.CustomObjectsApi()
 
 # Environment variables
@@ -31,8 +32,16 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
     Handle creation of PVCs with storageClassName 'pg-reflinker'.
     """
     # Check if storage class matches
-    if spec.get('storageClassName') != 'pg-reflinker':
+    storage_class_name = spec.get('storageClassName')
+    if storage_class_name != 'pg-reflinker':
         return  # Not our concern
+
+    # Get the storage class to determine reclaim policy
+    try:
+        storage_class = storage_v1.read_storage_class(storage_class_name)
+        reclaim_policy = storage_class.reclaim_policy or 'Retain'
+    except ApiException as e:
+        raise kopf.PermanentError(f"Failed to read storage class {storage_class_name}: {e}")
 
     # Extract dataSourceRef
     data_source = spec.get('dataSourceRef')
@@ -146,13 +155,20 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
             kind='PersistentVolume',
             metadata=client.V1ObjectMeta(
                 name=f'pv-{name}',
-                labels={'app.kubernetes.io/managed-by': 'pg-reflinker'}
+                labels={'app.kubernetes.io/managed-by': 'pg-reflinker'},
+                annotations={
+                    'pg-reflinker/source-cluster': cluster_name,
+                    'pg-reflinker/source-namespace': source_namespace,
+                    'pg-reflinker/source-pvc': source_pvc_name,
+                    'pg-reflinker/backup-label': backup_label,
+                }
             ),
             spec=client.V1PersistentVolumeSpec(
                 capacity={'storage': spec['resources']['requests']['storage']},
                 access_modes=['ReadWriteOnce'],
                 host_path=client.V1HostPathVolumeSource(path=pv_path),
-                storage_class_name='',
+                storage_class_name=storage_class_name,
+                persistent_volume_reclaim_policy=reclaim_policy,
                 claim_ref=client.V1ObjectReference(
                     kind='PersistentVolumeClaim',
                     name=name,
