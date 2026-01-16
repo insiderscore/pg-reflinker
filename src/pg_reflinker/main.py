@@ -165,7 +165,11 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
     
     try:
         # Connect to PostgreSQL with TLS cert auth
-        conn = connect_to_db(pod.status.pod_ip, 5432, 'streaming_replica', 'postgres', client_cert_path, client_key_path, ca_cert_path)
+        try:
+            conn = connect_to_db(pod.status.pod_ip, 5432, 'streaming_replica', 'postgres', client_cert_path, client_key_path, ca_cert_path)
+        except psycopg2.Error as e:
+            raise kopf.TemporaryError(f"Failed to connect to database: {e}", delay=30)
+        
         conn.autocommit = True
         
         try:
@@ -178,6 +182,8 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
                     snapshot_path = result[0]
                 else:
                     raise kopf.PermanentError("reflink_snapshot returned no result")
+        except psycopg2.Error as e:
+            raise kopf.PermanentError(f"Database query failed: {e}")
         finally:
             conn.close()
         
@@ -238,13 +244,19 @@ def handle_pv_delete(name, **kwargs):
         client_cert_path, client_key_path, ca_cert_path = create_temp_certs(replication_secret, ca_secret)
         
         try:
-            conn = connect_to_db(pod.status.pod_ip, 5432, 'streaming_replica', 'postgres', client_cert_path, client_key_path, ca_cert_path)
+            try:
+                conn = connect_to_db(pod.status.pod_ip, 5432, 'streaming_replica', 'postgres', client_cert_path, client_key_path, ca_cert_path)
+            except psycopg2.Error as e:
+                raise kopf.TemporaryError(f"Failed to connect to database: {e}", delay=30)
+            
             conn.autocommit = True
             
             try:
                 with conn.cursor() as cur:
                     # Call the delete_snapshot function
                     cur.execute("SELECT delete_snapshot(%s)", (source_backup_label,))
+            except psycopg2.Error as e:
+                raise kopf.PermanentError(f"Database query failed: {e}")
             finally:
                 conn.close()
         finally:
