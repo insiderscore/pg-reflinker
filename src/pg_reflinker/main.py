@@ -26,6 +26,60 @@ custom_api = client.CustomObjectsApi()
 # Environment variables
 HOSTPATH_PREFIX = os.getenv('HOSTPATH_PREFIX', '/var/lib/pg-reflinker')
 
+def get_cnpg_pod(cluster_name, namespace):
+    """Get the CNPG pod for a cluster in a namespace."""
+    pods = v1.list_namespaced_pod(namespace, label_selector=f'cnpg.io/cluster={cluster_name}')
+    if not pods.items:
+        raise kopf.TemporaryError(f"No pods found for cluster {cluster_name} in namespace {namespace}", delay=30)
+    return pods.items[0]
+
+def get_db_secrets(cluster_name, namespace):
+    """Get the replication and CA secrets for a cluster."""
+    replication_secret_name = f'{cluster_name}-replication'
+    ca_secret_name = f'{cluster_name}-ca'
+    replication_secret = v1.read_namespaced_secret(replication_secret_name, namespace)
+    ca_secret = v1.read_namespaced_secret(ca_secret_name, namespace)
+    return replication_secret, ca_secret
+
+def create_temp_certs(replication_secret, ca_secret):
+    """Create temporary certificate files and return their paths."""
+    client_cert_path = None
+    client_key_path = None
+    ca_cert_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.crt') as client_cert_file:
+            client_cert_file.write(base64.b64decode(replication_secret.data['tls.crt']).decode('utf-8'))
+            client_cert_path = client_cert_file.name
+        
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.key') as client_key_file:
+            client_key_file.write(base64.b64decode(replication_secret.data['tls.key']).decode('utf-8'))
+            client_key_path = client_key_file.name
+        
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.crt') as ca_cert_file:
+            ca_cert_file.write(base64.b64decode(ca_secret.data['ca.crt']).decode('utf-8'))
+            ca_cert_path = ca_cert_file.name
+        
+        return client_cert_path, client_key_path, ca_cert_path
+    except Exception:
+        # Clean up on failure
+        for path in [client_cert_path, client_key_path, ca_cert_path]:
+            if path and os.path.exists(path):
+                os.unlink(path)
+        raise
+
+def connect_to_db(db_host, db_port, db_user, db_name, client_cert_path, client_key_path, ca_cert_path):
+    """Connect to PostgreSQL with TLS certificate authentication."""
+    return psycopg2.connect(
+        host=db_host,
+        port=db_port,
+        user=db_user,
+        dbname=db_name,
+        sslmode='verify-ca',
+        sslcert=client_cert_path,
+        sslkey=client_key_path,
+        sslrootcert=ca_cert_path
+    )
+
 @kopf.on.create('persistentvolumeclaim')
 def handle_pvc_create(spec, name, namespace, **kwargs):
     """
@@ -90,49 +144,14 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
     if not cluster_name:
         raise kopf.PermanentError("Source PVC must be owned by a CNPG Cluster")
 
-    # Find the CNPG pod (assuming one pod per cluster for simplicity)
-    pods = v1.list_namespaced_pod(source_namespace, label_selector=f'cnpg.io/cluster={cluster_name}')
-    if not pods.items:
-        raise kopf.TemporaryError("No pods found for cluster", delay=30)
-    pod = pods.items[0]  # Take the first one
-
-    # Get database connection secrets (in the source namespace)
-    replication_secret_name = f'{cluster_name}-replication'
-    ca_secret_name = f'{cluster_name}-ca'
-    
-    replication_secret = v1.read_namespaced_secret(replication_secret_name, source_namespace)
-    ca_secret = v1.read_namespaced_secret(ca_secret_name, source_namespace)
-    
-    db_host = pod.status.pod_ip
-    db_port = 5432
-    db_user = 'streaming_replica'
-    db_name = 'postgres'
-    
-    # Write certs to temp files
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.crt') as client_cert_file:
-        client_cert_file.write(base64.b64decode(replication_secret.data['tls.crt']).decode('utf-8'))
-        client_cert_path = client_cert_file.name
-    
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.key') as client_key_file:
-        client_key_file.write(base64.b64decode(replication_secret.data['tls.key']).decode('utf-8'))
-        client_key_path = client_key_file.name
-    
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.crt') as ca_cert_file:
-        ca_cert_file.write(base64.b64decode(ca_secret.data['ca.crt']).decode('utf-8'))
-        ca_cert_path = ca_cert_file.name
+    # Get CNPG pod and secrets
+    pod = get_cnpg_pod(cluster_name, source_namespace)
+    replication_secret, ca_secret = get_db_secrets(cluster_name, source_namespace)
+    client_cert_path, client_key_path, ca_cert_path = create_temp_certs(replication_secret, ca_secret)
     
     try:
         # Connect to PostgreSQL with TLS cert auth
-        conn = psycopg2.connect(
-            host=db_host,
-            port=db_port,
-            user=db_user,
-            dbname=db_name,
-            sslmode='verify-ca',
-            sslcert=client_cert_path,
-            sslkey=client_key_path,
-            sslrootcert=ca_cert_path
-        )
+        conn = connect_to_db(pod.status.pod_ip, 5432, 'streaming_replica', 'postgres', client_cert_path, client_key_path, ca_cert_path)
         conn.autocommit = True
         
         try:
@@ -204,50 +223,12 @@ def handle_pv_delete(name, **kwargs):
 
     # Try to connect to the source cluster and delete the snapshot
     try:
-        # Find the CNPG pod
-        pods = v1.list_namespaced_pod(source_namespace, label_selector=f'cnpg.io/cluster={source_cluster}')
-        if not pods.items:
-            # Cluster or pods gone, nothing to clean up
-            return
-        pod = pods.items[0]
-
-        # Get database connection secrets
-        replication_secret_name = f'{source_cluster}-replication'
-        ca_secret_name = f'{source_cluster}-ca'
-        
-        replication_secret = v1.read_namespaced_secret(replication_secret_name, source_namespace)
-        ca_secret = v1.read_namespaced_secret(ca_secret_name, source_namespace)
-        
-        db_host = pod.status.pod_ip
-        db_port = 5432
-        db_user = 'streaming_replica'
-        db_name = 'postgres'
-        
-        # Write certs to temp files
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.crt') as client_cert_file:
-            client_cert_file.write(base64.b64decode(replication_secret.data['tls.crt']).decode('utf-8'))
-            client_cert_path = client_cert_file.name
-        
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.key') as client_key_file:
-            client_key_file.write(base64.b64decode(replication_secret.data['tls.key']).decode('utf-8'))
-            client_key_path = client_key_file.name
-        
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.crt') as ca_cert_file:
-            ca_cert_file.write(base64.b64decode(ca_secret.data['ca.crt']).decode('utf-8'))
-            ca_cert_path = ca_cert_file.name
+        pod = get_cnpg_pod(source_cluster, source_namespace)
+        replication_secret, ca_secret = get_db_secrets(source_cluster, source_namespace)
+        client_cert_path, client_key_path, ca_cert_path = create_temp_certs(replication_secret, ca_secret)
         
         try:
-            # Connect to PostgreSQL with TLS cert auth
-            conn = psycopg2.connect(
-                host=db_host,
-                port=db_port,
-                user=db_user,
-                dbname=db_name,
-                sslmode='verify-ca',
-                sslcert=client_cert_path,
-                sslkey=client_key_path,
-                sslrootcert=ca_cert_path
-            )
+            conn = connect_to_db(pod.status.pod_ip, 5432, 'streaming_replica', 'postgres', client_cert_path, client_key_path, ca_cert_path)
             conn.autocommit = True
             
             try:
