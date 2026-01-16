@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-pg-reflinker = "pg_reflinker.main:run"
+pg-reflinker = "pg_reflinker.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
