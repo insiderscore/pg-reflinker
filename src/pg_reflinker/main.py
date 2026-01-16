@@ -133,6 +133,10 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
         if not source_pvc:
             raise kopf.PermanentError(f"Source PVC {source_pvc_name} not found in any candidate namespace: {candidate_namespaces}")
 
+    # Ensure the source PVC is bound before proceeding
+    if source_pvc.status.phase != 'Bound':
+        raise kopf.TemporaryError(f"Source PVC {source_pvc_name} in namespace {source_namespace} is not bound yet", delay=30)
+
     # Find the CNPG cluster from ownerReferences of the source PVC
     owner_refs = source_pvc.metadata.owner_references or []
     cluster_name = None
@@ -146,7 +150,7 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
 
     # Get node affinity from the source PVC's bound PV
     node_affinity = None
-    if source_pvc.status.phase == 'Bound' and source_pvc.spec.volume_name:
+    if source_pvc.spec.volume_name:
         try:
             source_pv = v1.read_persistent_volume(source_pvc.spec.volume_name)
             node_affinity = source_pv.spec.node_affinity
