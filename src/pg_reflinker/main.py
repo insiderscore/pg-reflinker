@@ -187,10 +187,12 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
     
     conn.autocommit = True
     
+    import uuid
+    guid = str(uuid.uuid4())
     try:
         with conn.cursor() as cur:
-            # Call the reflink_snapshot function
-            backup_label = f'{namespace}-{name}'
+            # Use a GUID for the snapshot label to guarantee uniqueness
+            backup_label = guid
             cur.execute("SELECT reflink_snapshot(%s)", (backup_label,))
             result = cur.fetchone()
             if result:
@@ -201,20 +203,24 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
         raise kopf.PermanentError(f"Database query failed: {e}")
     finally:
         conn.close()
-    
-    # Create the PV
+
+    # Use the GUID as the PV name
+    pv_name = guid
     pv_path = os.path.join(HOSTPATH_PREFIX, snapshot_path.lstrip('/'))
     pv = client.V1PersistentVolume(
         api_version='v1',
         kind='PersistentVolume',
         metadata=client.V1ObjectMeta(
-            name=f'pv-{name}',
+            name=pv_name,
             labels={'app.kubernetes.io/managed-by': 'pg-reflinker'},
             annotations={
                 'pg-reflinker/source-cluster': cluster_name,
                 'pg-reflinker/source-namespace': source_namespace,
                 'pg-reflinker/source-pvc': source_pvc_name,
                 'pg-reflinker/source-backup-label': backup_label,
+                'pg-reflinker/snapshot-path': snapshot_path,
+                'pg-reflinker/claim-namespace': namespace,
+                'pg-reflinker/claim-name': name,
             }
         ),
         spec=client.V1PersistentVolumeSpec(

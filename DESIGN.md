@@ -1,5 +1,11 @@
 # pg-reflinker
 
+## Snapshot and PersistentVolume Naming (GUID-based)
+
+To guarantee uniqueness and prevent race conditions, each snapshot and PersistentVolume (PV) is named using a randomly generated GUID (UUID4). The GUID is used as the snapshot label, the PV name, and is stored in PV annotations. The original PVC name and namespace are stored in both the PV's claimRef and as annotations for traceability.
+
+This approach ensures that deleting and recreating a PVC with the same name will not result in naming conflicts or resource collisions.
+
 ## Overview
 
 This controller watches for PVCs requesting a particular storage class,
