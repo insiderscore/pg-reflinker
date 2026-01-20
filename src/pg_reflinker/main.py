@@ -80,6 +80,27 @@ def connect_to_db(db_host, db_port, db_user, db_name, client_cert_path, client_k
         sslrootcert=ca_cert_path
     )
 
+def get_db_connection(cluster_name, namespace):
+    """Get a database connection for a CNPG cluster."""
+    pod = get_cnpg_pod(cluster_name, namespace)
+    replication_secret, ca_secret = get_db_secrets(cluster_name, namespace)
+    client_cert_path, client_key_path, ca_cert_path = create_temp_certs(replication_secret, ca_secret)
+    
+    try:
+        conn = connect_to_db(pod.status.pod_ip, 5432, 'streaming_replica', 'postgres', client_cert_path, client_key_path, ca_cert_path)
+        # Clean up cert files immediately after successful connection
+        # psycopg2 loads certificates into memory during connection
+        for path in [client_cert_path, client_key_path, ca_cert_path]:
+            if path and os.path.exists(path):
+                os.unlink(path)
+        return conn
+    except Exception:
+        # Clean up certs on connection failure
+        for path in [client_cert_path, client_key_path, ca_cert_path]:
+            if path and os.path.exists(path):
+                os.unlink(path)
+        raise
+
 @kopf.on.create('persistentvolumeclaim')
 def handle_pvc_create(spec, name, namespace, **kwargs):
     """
@@ -159,69 +180,58 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
             pass
 
     # Get CNPG pod and secrets
-    pod = get_cnpg_pod(cluster_name, source_namespace)
-    replication_secret, ca_secret = get_db_secrets(cluster_name, source_namespace)
-    client_cert_path, client_key_path, ca_cert_path = create_temp_certs(replication_secret, ca_secret)
+    try:
+        conn = get_db_connection(cluster_name, source_namespace)
+    except psycopg2.Error as e:
+        raise kopf.TemporaryError(f"Failed to connect to database: {e}", delay=30)
+    
+    conn.autocommit = True
     
     try:
-        # Connect to PostgreSQL with TLS cert auth
-        try:
-            conn = connect_to_db(pod.status.pod_ip, 5432, 'streaming_replica', 'postgres', client_cert_path, client_key_path, ca_cert_path)
-        except psycopg2.Error as e:
-            raise kopf.TemporaryError(f"Failed to connect to database: {e}", delay=30)
-        
-        conn.autocommit = True
-        
-        try:
-            with conn.cursor() as cur:
-                # Call the reflink_snapshot function
-                backup_label = f'{namespace}-{name}'
-                cur.execute("SELECT reflink_snapshot(%s)", (backup_label,))
-                result = cur.fetchone()
-                if result:
-                    snapshot_path = result[0]
-                else:
-                    raise kopf.PermanentError("reflink_snapshot returned no result")
-        except psycopg2.Error as e:
-            raise kopf.PermanentError(f"Database query failed: {e}")
-        finally:
-            conn.close()
-        
-        # Create the PV
-        pv_path = os.path.join(HOSTPATH_PREFIX, snapshot_path.lstrip('/'))
-        pv = client.V1PersistentVolume(
-            api_version='v1',
-            kind='PersistentVolume',
-            metadata=client.V1ObjectMeta(
-                name=f'pv-{name}',
-                labels={'app.kubernetes.io/managed-by': 'pg-reflinker'},
-                annotations={
-                    'pg-reflinker/source-cluster': cluster_name,
-                    'pg-reflinker/source-namespace': source_namespace,
-                    'pg-reflinker/source-pvc': source_pvc_name,
-                    'pg-reflinker/source-backup-label': backup_label,
-                }
-            ),
-            spec=client.V1PersistentVolumeSpec(
-                capacity={'storage': spec['resources']['requests']['storage']},
-                access_modes=['ReadWriteOnce'],
-                host_path=client.V1HostPathVolumeSource(path=pv_path),
-                storage_class_name=storage_class_name,
-                persistent_volume_reclaim_policy=reclaim_policy,
-                node_affinity=node_affinity,
-                claim_ref=client.V1ObjectReference(
-                    kind='PersistentVolumeClaim',
-                    name=name,
-                    namespace=namespace
-                )
+        with conn.cursor() as cur:
+            # Call the reflink_snapshot function
+            backup_label = f'{namespace}-{name}'
+            cur.execute("SELECT reflink_snapshot(%s)", (backup_label,))
+            result = cur.fetchone()
+            if result:
+                snapshot_path = result[0]
+            else:
+                raise kopf.PermanentError("reflink_snapshot returned no result")
+    except psycopg2.Error as e:
+        raise kopf.PermanentError(f"Database query failed: {e}")
+    finally:
+        conn.close()
+    
+    # Create the PV
+    pv_path = os.path.join(HOSTPATH_PREFIX, snapshot_path.lstrip('/'))
+    pv = client.V1PersistentVolume(
+        api_version='v1',
+        kind='PersistentVolume',
+        metadata=client.V1ObjectMeta(
+            name=f'pv-{name}',
+            labels={'app.kubernetes.io/managed-by': 'pg-reflinker'},
+            annotations={
+                'pg-reflinker/source-cluster': cluster_name,
+                'pg-reflinker/source-namespace': source_namespace,
+                'pg-reflinker/source-pvc': source_pvc_name,
+                'pg-reflinker/source-backup-label': backup_label,
+            }
+        ),
+        spec=client.V1PersistentVolumeSpec(
+            capacity={'storage': spec['resources']['requests']['storage']},
+            access_modes=['ReadWriteOnce'],
+            host_path=client.V1HostPathVolumeSource(path=pv_path),
+            storage_class_name=storage_class_name,
+            persistent_volume_reclaim_policy=reclaim_policy,
+            node_affinity=node_affinity,
+            claim_ref=client.V1ObjectReference(
+                kind='PersistentVolumeClaim',
+                name=name,
+                namespace=namespace
             )
         )
-        v1.create_persistent_volume(pv)
-    finally:
-        # Clean up temp files
-        os.unlink(client_cert_path)
-        os.unlink(client_key_path)
-        os.unlink(ca_cert_path)
+    )
+    v1.create_persistent_volume(pv)
 
 @kopf.on.delete('persistentvolume', labels={'app.kubernetes.io/managed-by': 'pg-reflinker'})
 def handle_pv_delete(name, **kwargs):
@@ -239,31 +249,21 @@ def handle_pv_delete(name, **kwargs):
 
     # Try to connect to the source cluster and delete the snapshot
     try:
-        pod = get_cnpg_pod(source_cluster, source_namespace)
-        replication_secret, ca_secret = get_db_secrets(source_cluster, source_namespace)
-        client_cert_path, client_key_path, ca_cert_path = create_temp_certs(replication_secret, ca_secret)
+        try:
+            conn = get_db_connection(source_cluster, source_namespace)
+        except psycopg2.Error as e:
+            raise kopf.TemporaryError(f"Failed to connect to database: {e}", delay=30)
+        
+        conn.autocommit = True
         
         try:
-            try:
-                conn = connect_to_db(pod.status.pod_ip, 5432, 'streaming_replica', 'postgres', client_cert_path, client_key_path, ca_cert_path)
-            except psycopg2.Error as e:
-                raise kopf.TemporaryError(f"Failed to connect to database: {e}", delay=30)
-            
-            conn.autocommit = True
-            
-            try:
-                with conn.cursor() as cur:
-                    # Call the delete_snapshot function
-                    cur.execute("SELECT delete_snapshot(%s)", (source_backup_label,))
-            except psycopg2.Error as e:
-                raise kopf.PermanentError(f"Database query failed: {e}")
-            finally:
-                conn.close()
+            with conn.cursor() as cur:
+                # Call the delete_snapshot function
+                cur.execute("SELECT delete_snapshot(%s)", (source_backup_label,))
+        except psycopg2.Error as e:
+            raise kopf.PermanentError(f"Database query failed: {e}")
         finally:
-            # Clean up temp files
-            os.unlink(client_cert_path)
-            os.unlink(client_key_path)
-            os.unlink(ca_cert_path)
+            conn.close()
     except Exception as e:
         # Log the error but don't fail the PV deletion
         # In a real implementation, you'd want proper logging
