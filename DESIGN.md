@@ -86,3 +86,23 @@ the the `hostPath.path` or `local` volume.
 NAMESPACE_PATH - comma-delimited list of namespaces to search for the source PVC
 if the dataSourceRef does not specify a namespace (e.g., due to API server filtering).
 The operator first checks the current namespace, then each namespace in this list.
+
+## PV Cleanup and Snapshot Deletion
+
+When a PersistentVolume (PV) managed by pg-reflinker is deleted, the operator will:
+
+* Read the PV's annotations to determine the source cluster, namespace, backup label, and snapshot path.
+* Connect to the source CNPG cluster using the same secret-based authentication as for snapshot creation.
+* Call the `delete_snapshot(label)` function in the source database to remove the snapshot associated with the PV.
+* Errors during cleanup are logged, but do not block PV deletion.
+
+This ensures that storage is reclaimed and old snapshots do not accumulate when PVs are removed.
+
+## PersistentVolume Reclaim Policy
+
+When creating a PersistentVolume (PV), the operator reads the reclaim policy from the associated StorageClass. If the StorageClass does not specify a reclaim policy, the operator defaults to 'Retain' to prevent surpise deletes.
+
+### Handling Failed PersistentVolumes
+
+If a PersistentVolume managed by pg-reflinker enters the "Failed" phase, the operator will automatically delete the PV. A common cause is the local volume provisioner's inability to delete backing directories outside of `/tmp`. This auto-deletion triggers the same cleanup process as a regular PV deletion, ensuring that any associated reflink snapshots are also removed from the source database.
+
