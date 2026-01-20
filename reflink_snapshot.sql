@@ -35,10 +35,12 @@ BEGIN
     -- Start backup
     PERFORM
         pg_backup_start(backup_label, TRUE);
+    -- Create the snapshot directory
+    EXECUTE format('COPY (SELECT 1) TO PROGRAM %L', 'mkdir -p "' || snapshot_path || '"');
     -- Use a subdirectory under $REFLINK_DEST named after the backup_label
-    EXECUTE format('COPY (SELECT 1) TO PROGRAM %L', 'cp -a --reflink=always "$PGDATA" "' || snapshot_path || '"');
+    EXECUTE format('COPY (SELECT 1) TO PROGRAM %L', 'cp -a --reflink=always "$PGDATA" "' || snapshot_path || '/pgdata"');
     -- Stop backup and write label into the snapshot directory
-    EXECUTE format('COPY (SELECT labelfile FROM pg_backup_stop(FALSE)) TO PROGRAM %L WITH csv', 'head -c -2 | tail -c +2 | tee "' || snapshot_path || '/backup_label"');
+    EXECUTE format('COPY (SELECT labelfile FROM pg_backup_stop(FALSE)) TO PROGRAM %L WITH csv', 'head -c -2 | tail -c +2 | tee "' || snapshot_path || '/pgdata/backup_label"');
     -- Return the full filesystem path to the new snapshot
     RETURN backup_label;
 END;
