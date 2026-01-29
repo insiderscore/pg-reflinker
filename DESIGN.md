@@ -67,10 +67,20 @@ metadata:
 
 * Watch for new PVC objects matching our storageClassName
 * Look at the volume specified in dataSourceRef
-* Find the associated cnpg pod
-* Connect to the postgresql sevrer on the cnpg pod as the `streaming_replica` role using the postgresql client protocol. Use the secrets under Source Database Access to authenticate the connection.
-* Call `reflink_snapshot(label)`
-* Create the PV object, referencing the local filesystem directory with `hostPath` or `local`
+* Find the associated cnpg pod and cluster
+* Create a PV with local volume on the same node as the source pod
+* Create a Job that runs on that node, mounts the source PVC read-only and the destination local path as hostPath, connects to the database, performs pg_backup_start, reflink copy, pg_backup_stop, and writes the backup_label file
+* When the Job succeeds, bind the PV to the PVC by setting claimRef
+
+## The Populator Job
+
+* Created in the same namespace as the source CNPG cluster
+* Mount the source database PVC (read-only) and the destination local path (hostPath)
+* Use an initContainer running as root to create the destination directory and set ownership to uid/gid 26 (postgres user)
+* Use the same PostgreSQL image as specified in the source CNPG cluster spec to ensure psql compatibility
+* Connect to the postgresql server on the cnpg pod as the `streaming_replica` role using the secrets under Source Database Access to authenticate the connection.
+* Use psql with a here document to execute in a single session: `pg_backup_start(label, true)`, then shell command `cp -a --reflink=always $SOURCEMOUNT $DESTMOUNT/pgdata`, then `pg_backup_stop(false)` with output redirected to `$DESTMOUNT/pgdata/backup_label`
+* Exit zero on success, non-zero on any failure
 
 ## Environment Variables
 
@@ -81,22 +91,15 @@ NAMESPACE_PATH - comma-delimited list of namespaces to search for the source PVC
 if the dataSourceRef does not specify a namespace (e.g., due to API server filtering).
 The operator first checks the current namespace, then each namespace in this list.
 
-## Snapshot and PersistentVolume Naming (GUID-based)
+## Snapshot and PersistentVolume Naming (PVC UID-based)
 
-To guarantee uniqueness and prevent race conditions, each snapshot and PersistentVolume (PV) is named using a randomly generated GUID (UUID4). The GUID is used as the snapshot label, the PV name, and is stored in PV annotations. The original PVC name and namespace are stored in the PV's claimRef (to prevent it from being inadvertently claimed by another pvc) and as annotations for traceability.
+To guarantee uniqueness and prevent race conditions, each snapshot and PersistentVolume (PV) uses the PVC's metadata.uid as the identifier. The PV is named `pvc-<PVC_UID>` to follow Kubernetes naming conventions for storage controllers. The PVC UID is used as the snapshot label, stored in PV annotations, and used for internal tracking. The original PVC name and namespace are stored in the PV's claimRef (to prevent it from being inadvertently claimed by another pvc) and as annotations for traceability.
 
-This approach ensures that deleting and recreating a PVC with the same name will not result in naming conflicts or resource collisions.
+This approach ensures that each PVC creation results in a unique, deterministic identifier without conflicts.
 
 ## PV Cleanup and Snapshot Deletion
 
-When a PersistentVolume (PV) managed by pg-reflinker is deleted, the operator will:
-
-* Read the PV's annotations to determine the source cluster, namespace, backup label, and snapshot path.
-* Connect to the source CNPG cluster using the same secret-based authentication as for snapshot creation.
-* Call the `delete_snapshot(label)` function in the source database to remove the snapshot associated with the PV.
-* Errors during cleanup are logged, but do not block PV deletion.
-
-The goal is to ensure that storage is reclaimed and old snapshots do not accumulate when PVs are removed.
+When a PersistentVolume (PV) managed by pg-reflinker is deleted, the operator checks the reclaim policy. If the policy is 'Delete', it creates a cleanup Job that runs on the same node to remove the local directory containing the snapshot data. If the policy is 'Retain' (the default), the data remains on the node for manual cleanup or reuse.
 
 ## PersistentVolume Reclaim Policy
 

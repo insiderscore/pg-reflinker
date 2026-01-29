@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-pg-reflinker: Kubernetes operator for creating reflink snapshots of CNPG clusters.
-"""
-
 import kopf
 import kubernetes
 from kubernetes import client, config
@@ -11,6 +6,7 @@ import psycopg2
 import os
 import tempfile
 import base64
+import uuid
 
 # Load Kubernetes config
 try:
@@ -22,6 +18,7 @@ except config.ConfigException:
 v1 = client.CoreV1Api()
 storage_v1 = client.StorageV1Api()
 custom_api = client.CustomObjectsApi()
+batch_v1 = client.BatchV1Api()
 
 # Environment variables
 HOSTPATH_PREFIX = os.getenv('HOSTPATH_PREFIX', '/var/lib/pg-reflinker')
@@ -102,7 +99,7 @@ def get_db_connection(cluster_name, namespace):
         raise
 
 @kopf.on.create('persistentvolumeclaim')
-def handle_pvc_create(spec, name, namespace, **kwargs):
+def handle_pvc_create(spec, meta, name, namespace, **kwargs):
     """
     Handle creation of PVCs with storageClassName 'pg-reflinker'.
     """
@@ -172,6 +169,16 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
     if not cluster_name:
         raise kopf.PermanentError("Source PVC must be owned by a CNPG Cluster")
 
+    # Get the PostgreSQL image from the CNPG cluster spec
+    try:
+        cluster = custom_api.get_namespaced_custom_object('postgresql.cnpg.io', 'v1', source_namespace, 'clusters', cluster_name)
+        postgres_image = cluster.get('spec', {}).get('imageName')
+    except ApiException as e:
+        raise kopf.PermanentError(f"Failed to get cluster {cluster_name}: {e}")
+    
+    if not postgres_image:
+        postgres_image = 'postgres:16'  # default fallback
+
     # Get node affinity from the source PVC's bound PV
     node_affinity = None
     if source_pvc.spec.volume_name:
@@ -184,32 +191,20 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
 
     # Get CNPG pod and secrets
     try:
-        conn = get_db_connection(cluster_name, source_namespace)
-    except psycopg2.Error as e:
-        raise kopf.TemporaryError(f"Failed to connect to database: {e}", delay=30)
+        pod = get_cnpg_pod(cluster_name, source_namespace)
+        replication_secret, ca_secret = get_db_secrets(cluster_name, source_namespace)
+    except Exception as e:
+        raise kopf.TemporaryError(f"Failed to get pod or secrets: {e}", delay=30)
     
-    conn.autocommit = True
-    
-    import uuid
-    guid = str(uuid.uuid4())
-    try:
-        with conn.cursor() as cur:
-            # Use a GUID for the snapshot label to guarantee uniqueness
-            backup_label = guid
-            cur.execute("SELECT reflink_snapshot(%s)", (backup_label,))
-            result = cur.fetchone()
-            if result:
-                snapshot_path = result[0]
-            else:
-                raise kopf.PermanentError("reflink_snapshot returned no result")
-    except psycopg2.Error as e:
-        raise kopf.PermanentError(f"Database query failed: {e}")
-    finally:
-        conn.close()
+    source_node = pod.spec.node_name
+    pod_ip = pod.status.pod_ip
 
-    # Use the GUID as the PV name
-    pv_name = guid
-    pv_path = os.path.join(HOSTPATH_PREFIX, snapshot_path.lstrip('/'))
+    # Generate GUID for the snapshot - use PVC's UID for uniqueness
+    guid = meta.get('uid', str(uuid.uuid4()))
+    pv_name = f'pvc-{guid}'
+    pv_path = os.path.join(HOSTPATH_PREFIX, guid)
+
+    # Create the PV with local volume
     pv = client.V1PersistentVolume(
         api_version='v1',
         kind='PersistentVolume',
@@ -220,63 +215,269 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
                 'pg-reflinker/source-cluster': cluster_name,
                 'pg-reflinker/source-namespace': source_namespace,
                 'pg-reflinker/source-pvc': source_pvc_name,
-                'pg-reflinker/source-backup-label': backup_label,
-                'pg-reflinker/snapshot-path': snapshot_path,
+                'pg-reflinker/source-backup-label': guid,
                 'pg-reflinker/claim-namespace': namespace,
                 'pg-reflinker/claim-name': name,
+                'pg-reflinker/storage-class': storage_class_name,
+                'pg-reflinker/node': source_node,
             }
         ),
         spec=client.V1PersistentVolumeSpec(
             capacity={'storage': spec['resources']['requests']['storage']},
             access_modes=['ReadWriteOnce'],
-            host_path=client.V1HostPathVolumeSource(path=pv_path),
-            storage_class_name=storage_class_name,
+            local=client.V1LocalVolumeSource(path=pv_path),
+            # storage_class_name not set initially to prevent premature binding
             persistent_volume_reclaim_policy=reclaim_policy,
             node_affinity=node_affinity,
-            claim_ref=client.V1ObjectReference(
-                kind='PersistentVolumeClaim',
-                name=name,
-                namespace=namespace
-            )
         )
     )
     v1.create_persistent_volume(pv)
 
+    # Create the Job to perform the reflink backup
+    job_name = f'pg-reflinker-{guid}'
+    script = f'''
+#!/bin/bash
+set -e
+psql -h $PGHOST -p 5432 -U streaming_replica -d postgres -v ON_ERROR_STOP=1 -v TAG="$BACKUP_LABEL" <<EOF
+SELECT pg_backup_start('reflinker-' || :'TAG', true);
+\\! cp -a --reflink=always /source /dest/pgdata
+\\t
+\\a
+\\o /dest/pgdata/backup_label
+SELECT labelfile from pg_backup_stop(false);
+\\o
+EOF
+'''
+    job = client.V1Job(
+        api_version='batch/v1',
+        kind='Job',
+        metadata=client.V1ObjectMeta(
+            name=job_name,
+            namespace=source_namespace,
+            labels={'app.kubernetes.io/managed-by': 'pg-reflinker'}
+        ),
+        spec=client.V1JobSpec(
+            template=client.V1PodTemplateSpec(
+                spec=client.V1PodSpec(
+                    node_name=source_node,
+                    restart_policy='Never',
+                    security_context=client.V1PodSecurityContext(fs_group=26),
+                    init_containers=[
+                        client.V1Container(
+                            name='init-permissions',
+                            image='busybox:1.36',
+                            command=['sh', '-c', 'mkdir -p /dest && chown -R 26:26 /dest'],
+                            security_context=client.V1SecurityContext(run_as_user=0, run_as_group=0),
+                            volume_mounts=[
+                                client.V1VolumeMount(
+                                    name='dest-data',
+                                    mount_path='/dest'
+                                )
+                            ]
+                        )
+                    ],
+                    volumes=[
+                        client.V1Volume(
+                            name='source-data',
+                            persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                                claim_name=source_pvc_name,
+                                read_only=True
+                            )
+                        ),
+                        client.V1Volume(
+                            name='dest-data',
+                            host_path=client.V1HostPathVolumeSource(
+                                path=pv_path
+                            )
+                        ),
+                        client.V1Volume(
+                            name='replication-secret',
+                            secret=client.V1SecretVolumeSource(
+                                secret_name=f'{cluster_name}-replication',
+                                default_mode=0o640,
+                                items=[
+                                    client.V1KeyToPath(key='tls.crt', path='tls.crt', mode=0o640),
+                                    client.V1KeyToPath(key='tls.key', path='tls.key', mode=0o640)
+                                ]
+                            )
+                        ),
+                        client.V1Volume(
+                            name='ca-secret',
+                            secret=client.V1SecretVolumeSource(
+                                secret_name=f'{cluster_name}-ca',
+                                default_mode=0o640
+                            )
+                        )
+                    ],
+                    containers=[
+                        client.V1Container(
+                            name='reflink-backup',
+                            image=postgres_image,
+                            security_context=client.V1SecurityContext(run_as_user=26, run_as_group=26),
+                            command=['/bin/bash', '-c', script],
+                            env=[
+                                client.V1EnvVar(name='PGHOST', value=pod_ip),
+                                client.V1EnvVar(name='BACKUP_LABEL', value=guid),
+                                client.V1EnvVar(name='PGSSLMODE', value='verify-ca'),
+                                client.V1EnvVar(name='PGSSLCERT', value='/secrets/replication/tls.crt'),
+                                client.V1EnvVar(name='PGSSLKEY', value='/secrets/replication/tls.key'),
+                                client.V1EnvVar(name='PGSSLROOTCERT', value='/secrets/ca/ca.crt')
+                            ],
+                            volume_mounts=[
+                                client.V1VolumeMount(
+                                    name='source-data',
+                                    mount_path='/source'
+                                ),
+                                client.V1VolumeMount(
+                                    name='dest-data',
+                                    mount_path='/dest'
+                                ),
+                                client.V1VolumeMount(
+                                    name='replication-secret',
+                                    mount_path='/secrets/replication'
+                                ),
+                                client.V1VolumeMount(
+                                    name='ca-secret',
+                                    mount_path='/secrets/ca'
+                                )
+                            ]
+                        )
+                    ]
+                )
+            )
+        )
+    )
+    batch_v1.create_namespaced_job(source_namespace, job)
+
+@kopf.on.update('batch', 'v1', 'jobs', labels={'app.kubernetes.io/managed-by': 'pg-reflinker'}, field='status.conditions')
+def handle_job_succeeded(conditions, name, namespace, **kwargs):
+    """
+    Handle successful completion of the populator job by binding the PV to the PVC.
+    """
+    for cond in conditions:
+        if cond.type == 'Complete' and cond.status == 'True':
+            guid = name.split('-')[-1]
+            pv_name = f'pvc-{guid}'
+            try:
+                # Retrieve the PersistentVolume
+                pv: client.V1PersistentVolume = v1.read_persistent_volume(pv_name)
+
+                # Ensure metadata and annotations exist
+                if not pv.metadata or not pv.metadata.annotations:
+                    raise kopf.PermanentError(f"PersistentVolume {pv_name} is missing metadata or annotations.")
+
+                # Update the storage class and claim reference
+                storage_class = pv.metadata.annotations.get('pg-reflinker/storage-class')
+                claim_name = pv.metadata.annotations.get('pg-reflinker/claim-name')
+                claim_namespace = pv.metadata.annotations.get('pg-reflinker/claim-namespace')
+
+                if not storage_class or not claim_name or not claim_namespace:
+                    raise kopf.PermanentError(
+                        f"PersistentVolume {pv_name} is missing required annotations for binding."
+                    )
+
+                pv.spec.storage_class_name = storage_class
+                pv.spec.claim_ref = client.V1ObjectReference(
+                    kind='PersistentVolumeClaim',
+                    name=claim_name,
+                    namespace=claim_namespace
+                )
+
+                # Replace the PersistentVolume with updated details
+                v1.replace_persistent_volume(pv_name, pv)
+
+                # Log success
+                kopf.info(
+                    f"Successfully bound PV {pv_name} to PVC {claim_namespace}/{claim_name}",
+                    reason="JobSucceeded"
+                )
+            except ApiException as e:
+                # Log error details
+                kopf.error(
+                    f"Failed to bind PV {pv_name} to PVC: {e}",
+                    reason="JobSucceededError"
+                )
+            except kopf.PermanentError as e:
+                # Log permanent errors
+                kopf.error(
+                    f"Permanent error while processing PV {pv_name}: {e}",
+                    reason="JobSucceededPermanentError"
+                )
+            break
+
+@kopf.on.update('batch', 'v1', 'jobs', labels={'app.kubernetes.io/managed-by': 'pg-reflinker'}, field='status.conditions')
+def handle_job_failed(conditions, name, namespace, **kwargs):
+    for cond in conditions:
+        if cond.type == 'Failed' and cond.status == 'True':
+            guid = name.split('-')[-1]
+            pv_name = f'pvc-{guid}'
+            try:
+                v1.delete_persistent_volume(pv_name)
+            except ApiException:
+                pass
+            break
+
 @kopf.on.delete('persistentvolume', labels={'app.kubernetes.io/managed-by': 'pg-reflinker'})
 def handle_pv_delete(name, **kwargs):
     """
-    Handle deletion of PVs managed by pg-reflinker to clean up reflink snapshots.
+    Handle deletion of PVs managed by pg-reflinker to clean up local directories.
     """
-    # Get source information from annotations
-    annotations = kwargs.get('annotations', {})
-    source_cluster = annotations.get('pg-reflinker/source-cluster')
-    source_namespace = annotations.get('pg-reflinker/source-namespace')
-    source_backup_label = annotations.get('pg-reflinker/source-backup-label')
-
-    if not all([source_cluster, source_namespace, source_backup_label]):
-        return  # Missing required information
-
-    # Try to connect to the source cluster and delete the snapshot
-    try:
-        try:
-            conn = get_db_connection(source_cluster, source_namespace)
-        except psycopg2.Error as e:
-            raise kopf.TemporaryError(f"Failed to connect to database: {e}", delay=30)
+    # Get PV info from kwargs
+    pv = kwargs.get('body', {})
+    spec = pv.get('spec', {})
+    reclaim_policy = spec.get('persistentVolumeReclaimPolicy', 'Retain')
+    annotations = pv.get('metadata', {}).get('annotations', {})
+    
+    guid = annotations.get('pg-reflinker/source-backup-label')
+    if not guid:
+        return
+    
+    parent_path = HOSTPATH_PREFIX
+    
+    if reclaim_policy == 'Delete':
+        # Create a cleanup Job to delete the local directory
+        job_name = f'pg-reflinker-cleanup-{guid}'
+        node = annotations.get('pg-reflinker/node')
+        cleanup_namespace = annotations.get('pg-reflinker/source-namespace', 'default')
         
-        conn.autocommit = True
-        
-        try:
-            with conn.cursor() as cur:
-                # Call the delete_snapshot function
-                cur.execute("SELECT delete_snapshot(%s)", (source_backup_label,))
-        except psycopg2.Error as e:
-            raise kopf.PermanentError(f"Database query failed: {e}")
-        finally:
-            conn.close()
-    except Exception as e:
-        # Log the error but don't fail the PV deletion
-        # In a real implementation, you'd want proper logging
-        pass
+        job = client.V1Job(
+            api_version='batch/v1',
+            kind='Job',
+            metadata=client.V1ObjectMeta(
+                name=job_name,
+                namespace=cleanup_namespace,
+                labels={'app.kubernetes.io/managed-by': 'pg-reflinker'}
+            ),
+            spec=client.V1JobSpec(
+                template=client.V1PodTemplateSpec(
+                    spec=client.V1PodSpec(
+                        restart_policy='Never',
+                        node_name=node,
+                        volumes=[
+                            client.V1Volume(
+                                name='cleanup-data',
+                                host_path=client.V1HostPathVolumeSource(path=parent_path)
+                            )
+                        ],
+                        containers=[
+                            client.V1Container(
+                                name='cleanup',
+                                image='busybox:1.36',
+                                command=['sh', '-c', f'rm -rf /cleanup/{guid}'],
+                                security_context=client.V1SecurityContext(run_as_user=0, run_as_group=0),
+                                volume_mounts=[
+                                    client.V1VolumeMount(
+                                        name='cleanup-data',
+                                        mount_path='/cleanup'
+                                    )
+                                ]
+                            )
+                        ]
+                    )
+                )
+            )
+        )
+        batch_v1.create_namespaced_job(cleanup_namespace, job)
 
 @kopf.on.update('persistentvolume', labels={'app.kubernetes.io/managed-by': 'pg-reflinker'}, field='status.phase')
 def handle_pv_failed(old, new, **kwargs):
@@ -290,7 +491,7 @@ def handle_pv_failed(old, new, **kwargs):
         v1.delete_persistent_volume(name)
 
 def main():
-    kopf.run()
+    kopf.run(namespace=None)
 
 if __name__ == '__main__':
     main()
