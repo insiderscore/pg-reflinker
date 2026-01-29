@@ -254,7 +254,8 @@ EOF
         metadata=client.V1ObjectMeta(
             name=job_name,
             namespace=source_namespace,
-            labels={'app.kubernetes.io/managed-by': 'pg-reflinker'}
+            labels={'app.kubernetes.io/managed-by': 'pg-reflinker'},
+            annotations={'pg-reflinker/pv-guid': guid}
         ),
         spec=client.V1JobSpec(
             template=client.V1PodTemplateSpec(
@@ -349,67 +350,136 @@ EOF
     )
     batch_v1.create_namespaced_job(source_namespace, job)
 
-@kopf.on.update('batch', 'v1', 'jobs', labels={'app.kubernetes.io/managed-by': 'pg-reflinker'}, field='status.conditions')
-def handle_job_succeeded(conditions, name, namespace, **kwargs):
+@kopf.on.field('batch', 'v1', 'jobs', field='status.succeeded', labels={'app.kubernetes.io/managed-by': 'pg-reflinker'})
+def handle_job_succeeded(old, new, name, namespace, logger, **kwargs):
     """
     Handle successful completion of the populator job by binding the PV to the PVC.
     """
+    if not old and new == 1:
+        guid = name.replace('pg-reflinker-', '')
+        pv_name = f'pvc-{guid}'
+        try:
+            # Retrieve the PersistentVolume
+            pv: client.V1PersistentVolume = v1.read_persistent_volume(pv_name)
+
+            if not pv.spec:
+                raise kopf.PermanentError(f"PersistentVolume {pv_name} is missing spec.")
+
+            # Ensure metadata and annotations exist
+            if not pv.metadata or not pv.metadata.annotations:
+                raise kopf.PermanentError(f"PersistentVolume {pv_name} is missing metadata or annotations.")
+
+            # Update the storage class and claim reference
+            storage_class = pv.metadata.annotations.get('pg-reflinker/storage-class')
+            claim_name = pv.metadata.annotations.get('pg-reflinker/claim-name')
+            claim_namespace = pv.metadata.annotations.get('pg-reflinker/claim-namespace')
+
+            if not storage_class or not claim_name or not claim_namespace:
+                raise kopf.PermanentError(
+                    f"PersistentVolume {pv_name} is missing required annotations for binding."
+                )
+            
+            # Retrieve the PVC to get its UID for the claimRef
+            try:
+                pvc: client.V1PersistentVolumeClaim = v1.read_namespaced_persistent_volume_claim(claim_name, claim_namespace)
+            except ApiException as e:
+                raise kopf.PermanentError(f"Failed to retrieve PVC {claim_namespace}/{claim_name}: {e}")
+
+            pv.spec.storage_class_name = storage_class
+            pv.spec.claim_ref = client.V1ObjectReference(
+                kind='PersistentVolumeClaim',
+                name=claim_name,
+                namespace=claim_namespace,
+                uid=pvc.metadata.uid
+            )
+
+            # Replace the PersistentVolume with updated details
+            v1.replace_persistent_volume(pv_name, pv)
+
+            # Log success
+            logger.info(
+                f"Successfully bound PV {pv_name} to PVC {claim_namespace}/{claim_name}"
+            )
+        except ApiException as e:
+            # Log error details
+            error_message = f"API error while binding PV {pv_name}: {e.reason}"
+            logger.error(error_message)
+            raise kopf.PermanentError(error_message)
+        except kopf.PermanentError as e:
+            logger.error(str(e))
+            raise
+
+@kopf.on.field('batch', 'v1', 'jobs', field='status.failed', labels={'app.kubernetes.io/managed-by': 'pg-reflinker'})
+def handle_job_failed(old, new, name, namespace, logger, **kwargs):
+    if not old and new == 1:
+        logger.warning(f"Job {name} in namespace {namespace} failed. Cleaning up resources.")
+        guid = name.replace('pg-reflinker-', '')
+        pv_name = f'pvc-{guid}'
+        try:
+            v1.delete_persistent_volume(pv_name)
+            logger.info(f"Cleaned up PersistentVolume {pv_name} due to job failure.")
+        except ApiException as e:
+            if e.status == 404:
+                logger.info(f"PersistentVolume {pv_name} already deleted.")
+            else:
+                logger.error(f"Failed to delete PersistentVolume {pv_name}: {e}")
+
+@kopf.on.delete('persistentvolume', labels={'app.kubernetes.io/managed-by': 'pg-reflinker'})
+def handle_pv_delete(name, logger, **kwargs):
+    """
+    Handle deletion of PVs managed by pg-reflinker to clean up local directories.
+    """
+    # Get PV info from kwargs
+    pv = kwargs.get('body', {})
+    spec = pv.get('spec', {})
+    reclaim_policy = spec.get('persistentVolumeReclaimPolicy', 'Retain')
+    annotations = pv.get('metadata', {}).get('annotations', {})
+    
+    guid = annotations.get('pg-reflinker/source-backup-label')
+    if not guid:
+        logger.warning(f"PV {name} is missing the source-backup-label annotation. Cannot clean up.")
+        return
+    
+    parent_path = HOSTPATH_PREFIX
+    
+    if reclaim_policy == 'Delete':
+        # For 'Delete' policy, we need to remove the directory from the host path
+        # This requires running a privileged pod on the correct node.
+        # For simplicity in this example, we will log the action.
+        # A real implementation would create a cleanup job/pod.
+        logger.info(f"PV {name} with reclaim policy 'Delete'. Manual cleanup of path may be required.")
+        
+
+@kopf.on.field('persistentvolume', field='status.phase', labels={'app.kubernetes.io/managed-by': 'pg-reflinker'})
+def on_pv_phase_change(old, new, name, **kwargs):
+    """
+    When a PV becomes Released, if the reclaim policy is Retain, we should
+    clean up the hostPath directory.
+    """
+    if new == 'Released':
+        pv = v1.read_persistent_volume(name)
+        if pv.spec.persistent_volume_reclaim_policy == 'Retain':
+            # Similar to the delete handler, this would require a cleanup job.
+            # For now, we just log it.
+            pass
+
+@kopf.on.update('batch', 'v1', 'jobs', labels={'app.kubernetes.io/managed-by': 'pg-reflinker'}, field='status.conditions')
+def handle_job_failed(status, name, namespace, logger, **kwargs):
+    conditions = status.get('conditions', [])
     for cond in conditions:
-        if cond.type == 'Complete' and cond.status == 'True':
+        if cond.get('type') == 'Failed' and cond.get('status') == 'True':
+            logger.warning(f"Job {name} in namespace {namespace} failed. Cleaning up resources.")
             guid = name.split('-')[-1]
             pv_name = f'pvc-{guid}'
             try:
-                # Retrieve the PersistentVolume
-                pv: client.V1PersistentVolume = v1.read_persistent_volume(pv_name)
-
-                # Ensure metadata and annotations exist
-                if not pv.metadata or not pv.metadata.annotations:
-                    raise kopf.PermanentError(f"PersistentVolume {pv_name} is missing metadata or annotations.")
-
-                # Update the storage class and claim reference
-                storage_class = pv.metadata.annotations.get('pg-reflinker/storage-class')
-                claim_name = pv.metadata.annotations.get('pg-reflinker/claim-name')
-                claim_namespace = pv.metadata.annotations.get('pg-reflinker/claim-namespace')
-
-                if not storage_class or not claim_name or not claim_namespace:
-                    raise kopf.PermanentError(
-                        f"PersistentVolume {pv_name} is missing required annotations for binding."
-                    )
-
-                pv.spec.storage_class_name = storage_class
-                pv.spec.claim_ref = client.V1ObjectReference(
-                    kind='PersistentVolumeClaim',
-                    name=claim_name,
-                    namespace=claim_namespace
-                )
-
-                # Replace the PersistentVolume with updated details
-                v1.replace_persistent_volume(pv_name, pv)
-
-                # Log success
-                kopf.info(
-                    f"Successfully bound PV {pv_name} to PVC {claim_namespace}/{claim_name}",
-                    reason="JobSucceeded"
-                )
+                v1.delete_persistent_volume(pv_name)
+                logger.info(f"Cleaned up PersistentVolume {pv_name} due to job failure.")
             except ApiException as e:
-                # Log error details
-                kopf.error(
-                    f"Failed to bind PV {pv_name} to PVC: {e}",
-                    reason="JobSucceededError"
-                )
-            except kopf.PermanentError as e:
-                # Log permanent errors
-                kopf.error(
-                    f"Permanent error while processing PV {pv_name}: {e}",
-                    reason="JobSucceededPermanentError"
-                )
-            break
-
-@kopf.on.update('batch', 'v1', 'jobs', labels={'app.kubernetes.io/managed-by': 'pg-reflinker'}, field='status.conditions')
-def handle_job_failed(conditions, name, namespace, **kwargs):
-    for cond in conditions:
-        if cond.type == 'Failed' and cond.status == 'True':
-            guid = name.split('-')[-1]
+                if e.status == 404:
+                    logger.info(f"PersistentVolume {pv_name} already deleted.")
+                else:
+                    logger.error(f"Failed to delete PersistentVolume {pv_name}: {e}")
+            breakguid = name.split('-')[-1]
             pv_name = f'pvc-{guid}'
             try:
                 v1.delete_persistent_volume(pv_name)
