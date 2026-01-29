@@ -2,7 +2,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: pg-reflinker
-provisioner: kubernetes.io/no-provisioner # Manual provisioning - handled by the pg-reflinker operator
+provisioner: k8s.insiderscore.com/pg-reflinker # Manual provisioning - handled by the pg-reflinker operator
 reclaimPolicy: Delete
 volumeBindingMode: Immediate
 allowVolumeExpansion: false

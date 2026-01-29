@@ -106,17 +106,20 @@ def handle_pvc_create(spec, name, namespace, **kwargs):
     """
     Handle creation of PVCs with storageClassName 'pg-reflinker'.
     """
-    # Check if storage class matches
-    storage_class_name = spec.get('storageClassName')
-    if storage_class_name != 'pg-reflinker':
-        return  # Not our concern
 
-    # Get the storage class to determine reclaim policy
+    # Get the storage class and check provisioner
+    storage_class_name = spec.get('storageClassName')
+    if not storage_class_name:
+        return  # No storage class specified
     try:
         storage_class = storage_v1.read_storage_class(storage_class_name)
-        reclaim_policy = storage_class.reclaim_policy or 'Retain'
     except ApiException as e:
         raise kopf.PermanentError(f"Failed to read storage class {storage_class_name}: {e}")
+
+    if storage_class.provisioner != 'k8s.insiderscore.com/pg-reflinker':
+        return  # Not our concern
+
+    reclaim_policy = storage_class.reclaim_policy or 'Retain'
 
     # Extract dataSourceRef
     data_source = spec.get('dataSourceRef')

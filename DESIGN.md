@@ -1,16 +1,10 @@
 # pg-reflinker
 
-## Snapshot and PersistentVolume Naming (GUID-based)
-
-To guarantee uniqueness and prevent race conditions, each snapshot and PersistentVolume (PV) is named using a randomly generated GUID (UUID4). The GUID is used as the snapshot label, the PV name, and is stored in PV annotations. The original PVC name and namespace are stored in both the PV's claimRef and as annotations for traceability.
-
-This approach ensures that deleting and recreating a PVC with the same name will not result in naming conflicts or resource collisions.
-
 ## Overview
 
-This controller watches for PVCs requesting a particular storage class,
-contacts another controller to request a CNPG reflink snapshot, and then
-creates a hostPath/local PV for that snapshot.
+This controller watches for PVCs requesting its storage class, contacts
+the follower cluster to request a CNPG reflink snapshot on local storage,
+and then creates a hostPath/local PV for that snapshot.
 
 ## Example PVC
 
@@ -58,8 +52,8 @@ pg-xyz-replication   kubernetes.io/tls   2      21h
 ```yaml
 apiVersion: v1
 data:
-  ca.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUJsekNDQVQ2Z0F3SUJBZ0lRUkw4eGlLSWV5WTBXU3MwcSsvTHFrVEFLQmdncWhrak9QUVFEQWpBc01SUXcKRWdZRFZRUUxFd3R3WnkxbWIyeHNiM2RsY2pFVU1CSUdBMVVFQXhNTGNHY3RabTlzYkc5M1pYSXdIaGNOTWpZdwpNVEUxTVRjME56QTBXaGNOTWpZd05ERTFNVGMwTnpBMFdqQXNNUlF3RWdZRFZRUUxFd3R3WnkxbWIyeHNiM2RsCmNqRVVNQklHQTFVRUF4TUxjR2N0Wm05c2JHOTNaWEl3V1RBVEJnY3Foa2pPUFFJQkJnZ3Foa2pPUFFNQkJ3TkMKQUFTMUFSc2EzU3hQTmtxTjlSc0NhWWM2Sjh2UmoyUERxQy93Q3BTUStnYnFNamtnQ3JlU2gvNml0SitQTlp3TApuN242MC9ObjdUcms5bThqNHVoWUt2NWtvMEl3UURBT0JnTlZIUThCQWY4RUJBTUNBZ1F3RHdZRFZSMFRBUUgvCkJBVXdBd0VCL3pBZEJnTlZIUTRFRmdRVWI1OThiNlNoVkxicE0ydW1ha3NURm1tdWF6SXdDZ1lJS29aSXpqMEUKQXdJRFJ3QXdSQUlnQUpUS0cxUVZGWmJ5SDBrbm9FbUZ1bm9ldTlHRjB6UFRPcWFDQ0ZuVEJWd0NJRHE0VStwUApFSEU4ekpZd01zbEVvam8yWnNTN3FDQ29CR3hNck1zeVhKYnMKLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=
-  ca.key: LS0tLS1CRUdJTiBFQyBQUklWQVRFIEtFWS0tLS0tCk1IY0NBUUVFSU1CQk9LVS9TUVk3MnNFUUJpWFU5dlJocGlkVGFwQi9xU3R3SnBXdXA5elFvQW9HQ0NxR1NNNDkKQXdFSG9VUURRZ0FFdFFFYkd0MHNUelpLamZVYkFtbUhPaWZMMFk5anc2Z3Y4QXFVa1BvRzZqSTVJQXEza29mKwpvclNmanpXY0M1KzUrdFB6WiswNjVQWnZJK0xvV0NyK1pBPT0KLS0tLS1FTkQgRUMgUFJJVkFURSBLRVktLS0tLQo=
+  ca.crt: LS0..LQo=
+  ca.key: LS0...LQo=
 kind: Secret
 metadata:
   creationTimestamp: "2026-01-15T17:52:04Z"
@@ -87,6 +81,12 @@ NAMESPACE_PATH - comma-delimited list of namespaces to search for the source PVC
 if the dataSourceRef does not specify a namespace (e.g., due to API server filtering).
 The operator first checks the current namespace, then each namespace in this list.
 
+## Snapshot and PersistentVolume Naming (GUID-based)
+
+To guarantee uniqueness and prevent race conditions, each snapshot and PersistentVolume (PV) is named using a randomly generated GUID (UUID4). The GUID is used as the snapshot label, the PV name, and is stored in PV annotations. The original PVC name and namespace are stored in the PV's claimRef (to prevent it from being inadvertently claimed by another pvc) and as annotations for traceability.
+
+This approach ensures that deleting and recreating a PVC with the same name will not result in naming conflicts or resource collisions.
+
 ## PV Cleanup and Snapshot Deletion
 
 When a PersistentVolume (PV) managed by pg-reflinker is deleted, the operator will:
@@ -96,7 +96,7 @@ When a PersistentVolume (PV) managed by pg-reflinker is deleted, the operator wi
 * Call the `delete_snapshot(label)` function in the source database to remove the snapshot associated with the PV.
 * Errors during cleanup are logged, but do not block PV deletion.
 
-This ensures that storage is reclaimed and old snapshots do not accumulate when PVs are removed.
+The goal is to ensure that storage is reclaimed and old snapshots do not accumulate when PVs are removed.
 
 ## PersistentVolume Reclaim Policy
 
@@ -105,4 +105,3 @@ When creating a PersistentVolume (PV), the operator reads the reclaim policy fro
 ### Handling Failed PersistentVolumes
 
 If a PersistentVolume managed by pg-reflinker enters the "Failed" phase, the operator will automatically delete the PV. A common cause is the local volume provisioner's inability to delete backing directories outside of `/tmp`. This auto-deletion triggers the same cleanup process as a regular PV deletion, ensuring that any associated reflink snapshots are also removed from the source database.
-
